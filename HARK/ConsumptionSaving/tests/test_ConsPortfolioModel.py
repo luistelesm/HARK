@@ -222,3 +222,85 @@ class testPortfolioConsumerTypeDiscreteAndJoint(unittest.TestCase):
 
         # Solve model under given parameters
         self.discrete_and_joint.solve()
+
+
+class testRiskyReturnDim(PortfolioConsumerTypeTestCase):
+    def test_simulation(self):
+        # Setup
+        self.pcct.T_sim = 30
+        self.pcct.AgentCount = 10
+        self.pcct.track_vars += [
+            "mNrm",
+            "cNrm",
+            "Risky",
+        ]
+        # Common (default) simulation
+        self.pcct.initialize_sim()
+        self.pcct.simulate()
+        # Assety that all columns of Risky are the same
+        self.assertTrue(
+            np.all(
+                self.pcct.history["Risky"]
+                == self.pcct.history["Risky"][:, 0][:, np.newaxis]
+            )
+        )
+        # Agent specific simulation
+        self.pcct.sim_common_Rrisky = False
+        self.pcct.initialize_sim()
+        self.pcct.simulate()
+        # Assety that all columns of Risky are not the same
+        self.assertFalse(
+            np.all(
+                self.pcct.history["Risky"]
+                == self.pcct.history["Risky"][:, 0][:, np.newaxis]
+            )
+        )
+
+
+class test_time_varying_Risky_Rfree_and_Adj(unittest.TestCase):
+    def setUp(self):
+        # Create a parameter dictionary for a three period problem
+        self.params = cpm.init_portfolio.copy()
+        # Update time varying parameters
+        self.params.update(
+            {
+                "cycles": 1,
+                "T_cycle": 3,
+                "T_age": 3,
+                "Rfree": [1.0, 0.99, 0.98],
+                "RiskyAvg": [1.01, 1.02, 1.03],
+                "RiskyStd": [0.0, 0.0, 0.0],
+                "RiskyCount": 1,
+                "AdjustPrb": [0.0, 1.0, 0.0],
+                "PermGroFac": [1.0, 1.0, 1.0],
+                "LivPrb": [0.5, 0.5, 0.5],
+                "PermShkStd": [0.0, 0.0, 0.0],
+                "TranShkStd": [0.0, 0.0, 0.0],
+                "T_sim": 50,
+                "sim_common_Rrisky": False,
+                "AgentCount": 10,
+            }
+        )
+
+        # Create and solve agent
+        self.agent = cpm.PortfolioConsumerType(**self.params)
+        self.agent.solve()
+
+    def test_draws(self):
+        # Simulate the agent
+        self.agent.track_vars = ["t_age", "t_cycle", "Adjust", "Risky"]
+        self.agent.initialize_sim()
+        self.agent.simulate()
+
+        # Check that returns and adjustment draws are correct
+        Rrisky_draws = self.agent.history["Risky"]
+        Adjust_draws = self.agent.history["Adjust"]
+        # t_age is increased before being recorded
+        t_age = self.agent.history["t_age"] - 1
+
+        # Check that the draws are correct
+        self.assertTrue(np.all(Rrisky_draws[t_age == 1] == 1.01))
+        self.assertTrue(np.all(Rrisky_draws[t_age == 2] == 1.02))
+        # Adjust
+        self.assertTrue(np.all(Adjust_draws[t_age == 1] == 0))
+        self.assertTrue(np.all(Adjust_draws[t_age == 2] == 1))

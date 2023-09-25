@@ -61,6 +61,11 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
         if not hasattr(self, "PortfolioBisect"):
             self.PortfolioBisect = False
 
+        # Boolean determines whether, when simulating a given time period,
+        # all agents will draw the same risky return factor (true by default)
+        if not hasattr(self, "sim_common_Rrisky"):
+            self.sim_common_Rrisky = True
+
         # Initialize a basic consumer type
         IndShockConsumerType.__init__(self, verbose=verbose, quiet=quiet, **kwds)
 
@@ -81,7 +86,7 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
 
     def update(self):
         IndShockConsumerType.update(self)
-        self.update_AdjustPrb()
+        self.update_AdjustDstn()
         self.update_RiskyDstn()
         self.update_ShockDstn()
 
@@ -118,8 +123,8 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
         else:
             self.add_to_time_inv("RiskyAvg", "RiskyStd")
 
-        # Generate a discrete approximation to the risky return distribution if the
-        # agent has age-varying beliefs about the risky asset
+        # Generate a discrete approximation to the risky return distribution
+        # if its parameters are time-varying
         if "RiskyAvg" in self.time_vary:
             self.RiskyDstn = IndexDistribution(
                 Lognormal.from_mean_std,
@@ -129,8 +134,8 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
 
             self.add_to_time_vary("RiskyDstn")
 
-        # Generate a discrete approximation to the risky return distribution if the
-        # agent does *not* have age-varying beliefs about the risky asset (base case)
+        # Generate a discrete approximation to the risky return distribution if
+        # its parameters are constant
         else:
             self.RiskyDstn = Lognormal.from_mean_std(
                 self.RiskyAvg, self.RiskyStd
@@ -188,7 +193,7 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
         self.IndepDstnBool = True
         self.add_to_time_inv("IndepDstnBool")
 
-    def update_AdjustPrb(self):
+    def update_AdjustDstn(self):
         """
         Checks and updates the exogenous probability of the agent being allowed
         to rebalance his portfolio/contribution scheme. It can be time varying.
@@ -204,12 +209,20 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
         """
         if type(self.AdjustPrb) is list and (len(self.AdjustPrb) == self.T_cycle):
             self.add_to_time_vary("AdjustPrb")
+
+            self.AdjustDstn = IndexDistribution(
+                Bernoulli, {"p": self.AdjustPrb}, seed=self.RNG.integers(0, 2**31 - 1)
+            )
+
         elif type(self.AdjustPrb) is list:
             raise AttributeError(
                 "If AdjustPrb is time-varying, it must have length of T_cycle!"
             )
         else:
             self.add_to_time_inv("AdjustPrb")
+            self.AdjustDstn = Bernoulli(
+                p=self.AdjustPrb, seed=self.RNG.integers(0, 2**31 - 1)
+            )
 
     def update_ShareLimit(self):
         """
@@ -224,15 +237,21 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
         -------
         None
         """
-        if "RiskyDstn" in self.time_vary:
+        if "RiskyDstn" in self.time_vary or "Rfree" in self.time_vary:
             self.ShareLimit = []
             for t in range(self.T_cycle):
-                RiskyDstn = self.RiskyDstn[t]
+                if "RiskyDstn" in self.time_vary:
+                    RiskyDstn = self.RiskyDstn[t]
+                else:
+                    RiskyDstn = self.RiskyDstn
+                if "Rfree" in self.time_vary:
+                    Rfree = self.Rfree[t]
+                else:
+                    Rfree = self.Rfree
 
                 def temp_f(s):
                     return -((1.0 - self.CRRA) ** -1) * np.dot(
-                        (self.Rfree + s * (RiskyDstn.atoms - self.Rfree))
-                        ** (1.0 - self.CRRA),
+                        (Rfree + s * (RiskyDstn.atoms - Rfree)) ** (1.0 - self.CRRA),
                         RiskyDstn.pmv,
                     )
 
@@ -300,9 +319,7 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
 
     def get_Risky(self):
         """
-        Sets the attribute Risky as a single draw from a lognormal distribution.
-        Uses the attributes RiskyAvgTrue and RiskyStdTrue if RiskyAvg is time-varying,
-        else just uses the single values from RiskyAvg and RiskyStd.
+        Draws a new risky return factor.
 
         Parameters
         ----------
@@ -312,16 +329,28 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
         -------
         None
         """
-        if "RiskyDstn" in self.time_vary:
-            RiskyAvg = self.RiskyAvgTrue
-            RiskyStd = self.RiskyStdTrue
-        else:
-            RiskyAvg = self.RiskyAvg
-            RiskyStd = self.RiskyStd
 
-        self.shocks["Risky"] = Lognormal.from_mean_std(
-            RiskyAvg, RiskyStd, seed=self.RNG.integers(0, 2**31 - 1)
-        ).draw(1)
+        # How we draw the shocks depends on whether their distribution is time-varying
+        if "RiskyDstn" in self.time_vary:
+            if self.sim_common_Rrisky:
+                raise AttributeError(
+                    "If sim_common_Rrisky is True, RiskyDstn cannot be time-varying!"
+                )
+
+            else:
+                # Make use of the IndexDistribution.draw() method
+                self.shocks["Risky"] = self.RiskyDstn.draw(
+                    np.maximum(self.t_cycle - 1, 0)
+                    if self.cycles == 1
+                    else self.t_cycle
+                )
+
+        else:
+            # Draw either a common economy-wide return, or one for each agent
+            if self.sim_common_Rrisky:
+                self.shocks["Risky"] = self.RiskyDstn.draw(1)
+            else:
+                self.shocks["Risky"] = self.RiskyDstn.draw(self.AgentCount)
 
     def get_Adjust(self):
         """
@@ -337,9 +366,12 @@ class IndShockRiskyAssetConsumerType(IndShockConsumerType):
         -------
         None
         """
-        self.shocks["Adjust"] = IndexDistribution(
-            Bernoulli, {"p": self.AdjustPrb}, seed=self.RNG.integers(0, 2**31 - 1)
-        ).draw(self.t_cycle)
+        if "AdjustPrb" in self.time_vary:
+            self.shocks["Adjust"] = self.AdjustDstn.draw(
+                np.maximum(self.t_cycle - 1, 0) if self.cycles == 1 else self.t_cycle
+            )
+        else:
+            self.shocks["Adjust"] = self.AdjustDstn.draw(self.AgentCount)
 
     def initialize_sim(self):
         """
@@ -1298,13 +1330,16 @@ class ConsFixedPortfolioIndShkRiskyAssetSolver(ConsIndShockSolver):
 
 risky_asset_parms = {
     # Risky return factor moments. Based on SP500 real returns from Shiller's
-    # "chapter 26" data, which can be found at http://www.econ.yale.edu/~shiller/data.htm
+    # "chapter 26" data, which can be found at https://www.econ.yale.edu/~shiller/data.htm
     "RiskyAvg": 1.080370891,
     "RiskyStd": 0.177196585,
     # Number of integration nodes to use in approximation of risky returns
     "RiskyCount": 5,
     # Probability that the agent can adjust their portfolio each period
     "AdjustPrb": 1.0,
+    # When simulating the model, should all agents get the same risky return in
+    # a given period?
+    "sim_common_Rrisky": True,
 }
 
 # Make a dictionary to specify a risky asset consumer type

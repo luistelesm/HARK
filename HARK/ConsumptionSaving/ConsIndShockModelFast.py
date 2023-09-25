@@ -9,7 +9,7 @@ It currently solves three types of models:
    3) The model described in (2), with an interest rate for debt that differs
       from the interest rate for savings. #todo
 
-See NARK https://HARK.githhub.io/Documentation/NARK for information on variable naming conventions.
+See NARK https://github.com/econ-ark/HARK/blob/master/Documentation/NARK/NARK.pdf for information on variable naming conventions.
 See HARK documentation for mathematical descriptions of the models being solved.
 """
 
@@ -20,7 +20,7 @@ from interpolation import interp
 from numba import njit
 from quantecon.optimize import newton_secant
 
-from HARK import MetricObject, make_one_period_oo_solver
+from HARK import make_one_period_oo_solver
 from HARK.ConsumptionSaving.ConsIndShockModel import (
     ConsIndShockSolverBasic,
     ConsPerfForesightSolver,
@@ -36,6 +36,7 @@ from HARK.interpolation import (
     MargValueFuncCRRA,
     ValueFuncCRRA,
 )
+from HARK.metric import MetricObject
 from HARK.numba_tools import (
     CRRAutility,
     CRRAutility_inv,

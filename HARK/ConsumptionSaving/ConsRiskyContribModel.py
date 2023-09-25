@@ -8,24 +8,26 @@ asset.
 The model is described in detail in the REMARK:
 https://econ-ark.org/materials/riskycontrib
 
-@software{mateo_velasquez_giraldo_2021_4977915,
-  author       = {Mateo Velásquez-Giraldo},
-  title        = {{Mv77/RiskyContrib: A Two-Asset Savings Model with
-                   an Income-Contribution Scheme}},
-  month        = jun,
-  year         = 2021,
-  publisher    = {Zenodo},
-  version      = {v1.0.1},
-  doi          = {10.5281/zenodo.4977915},
-  url          = {https://doi.org/10.5281/zenodo.4977915}
-}
+.. code:: bibtex
+
+   @software{mateo_velasquez_giraldo_2021_4977915,
+     author       = {Mateo Velásquez-Giraldo},
+     title        = {{Mv77/RiskyContrib: A Two-Asset Savings Model with
+                      an Income-Contribution Scheme}},
+     month        = jun,
+     year         = 2021,
+     publisher    = {Zenodo},
+     version      = {v1.0.1},
+     doi          = {10.5281/zenodo.4977915},
+     url          = {https://doi.org/10.5281/zenodo.4977915}
+   }
 
 """
 from copy import deepcopy
 
 import numpy as np
 
-from HARK import MetricObject, NullFunc  # Basic HARK features
+from HARK import NullFunc  # Basic HARK features
 from HARK.ConsumptionSaving.ConsIndShockModel import utility  # CRRA utility function
 from HARK.ConsumptionSaving.ConsIndShockModel import (
     utility_inv,  # Inverse CRRA utility function
@@ -53,6 +55,7 @@ from HARK.interpolation import (
 from HARK.interpolation import LinearInterp  # Piecewise linear interpolation
 from HARK.interpolation import TrilinearInterp  # 3D interpolator
 from HARK.interpolation import DiscreteInterp, MargValueFuncCRRA, ValueFuncCRRA
+from HARK.metric import MetricObject
 from HARK.utilities import make_grid_exp_mult
 
 
@@ -64,9 +67,10 @@ class RiskyContribConsumerType(RiskyAssetConsumerType):
     asset.
 
     The frictions are:
-        - A proportional tax on funds moved from the risky to the risk-free
-         asset.
-        - A stochastic inability to move funds between his accounts.
+
+    - A proportional tax on funds moved from the risky to the risk-free
+      asset.
+    - A stochastic inability to move funds between his accounts.
 
     To partially avoid the second friction, the agent can commit to have a
     fraction of his labor income, which is usually deposited in his risk-free
@@ -896,7 +900,7 @@ def rebalance_assets(d, m, n, tau):
     ----------
     d : np.array
         Array with rebalancing decisions. d > 0 represents depositing d*m into
-        the risky asset account. d<0 represents withdrawing |d|*n (pre-tax)
+        the risky asset account. d<0 represents withdrawing ``|d|*n`` (pre-tax)
         from the risky account into the risky account.
     m : np.array
         Initial risk-free assets.

@@ -6,154 +6,267 @@ of agents, where agents take the inputs to their problem as exogenous.  A macro
 model adds an additional layer, endogenizing some of the inputs to the micro
 problem by finding a general equilibrium dynamic rule.
 """
-import os
 import sys
+from collections import defaultdict, namedtuple
 from copy import copy, deepcopy
-from distutils.dir_util import copy_tree
+from dataclasses import dataclass, field
 from time import time
+from typing import Any, Dict, List, NewType, Optional, Union
 from warnings import warn
 
 import numpy as np
+import pandas as pd
+from xarray import DataArray
 
 from HARK.distribution import (
     Distribution,
     IndexDistribution,
     TimeVaryingDiscreteDistribution,
+    combine_indep_dstns,
 )
+from HARK.parallel import multi_thread_commands, multi_thread_commands_fake
+from HARK.utilities import NullFunc, get_arg_names
 
-from .parallel import multi_thread_commands, multi_thread_commands_fake
-from .utilities import NullFunc, get_arg_names
+# Set logging and define basic functions
+import logging
+logging.basicConfig(format="%(message)s")
+_log = logging.getLogger("HARK")
+_log.setLevel(logging.ERROR)
 
 
-def distance_metric(thing_a, thing_b):
+def disable_logging():
+    _log.disabled = True
+
+
+def enable_logging():
+    _log.disabled = False
+
+
+def warnings():
+    _log.setLevel(logging.WARNING)
+
+
+def quiet():
+    _log.setLevel(logging.ERROR)
+
+
+def verbose():
+    _log.setLevel(logging.INFO)
+
+
+def set_verbosity_level(level):
+    _log.setLevel(level)
+
+
+class Parameters:
     """
-    A "universal distance" metric that can be used as a default in many settings.
+    This class defines an object that stores all of the parameters for a model
+    as an internal dictionary. It is designed to also handle the age-varying
+    dynamics of parameters.
 
-    Parameters
+    Attributes
     ----------
-    thing_a : object
-        A generic object.
-    thing_b : object
-        Another generic object.
 
-    Returns:
-    ------------
-    distance : float
-        The "distance" between thing_a and thing_b.
-    """
-    # Get the types of the two inputs
-    type_a = type(thing_a)
-    type_b = type(thing_b)
-
-    if type_a is list and type_b is list:
-        len_a = len(thing_a)  # If both inputs are lists, then the distance between
-        len_b = len(thing_b)  # them is the maximum distance between corresponding
-        if len_a == len_b:  # elements in the lists.  If they differ in length,
-            distance_temp = []  # the distance is the difference in lengths.
-            for n in range(len_a):
-                distance_temp.append(distance_metric(thing_a[n], thing_b[n]))
-            distance = max(distance_temp)
-        else:
-            warn(
-                "Objects of different lengths are being compared. "
-                + "Returning difference in lengths."
-            )
-            distance = float(abs(len_a - len_b))
-    # If both inputs are dictionaries, call distance on the list of its elements
-    elif type_a is dict and type_b is dict:
-        len_a = len(thing_a)
-        len_b = len(thing_b)
-
-        if len_a == len_b:
-            # Create versions sorted by key
-            sorted_a = dict(sorted(thing_a.items()))
-            sorted_b = dict(sorted(thing_b.items()))
-
-            # If keys don't match, print a warning.
-            if list(sorted_a.keys()) != list(sorted_b.keys()):
-                warn(
-                    "Dictionaries with keys that do not match are being " + "compared."
-                )
-
-            distance = distance_metric(list(sorted_a.values()), list(sorted_b.values()))
-
-        else:
-            # If they have different lengths, log a warning and return the
-            # difference in lengths.
-            warn(
-                "Objects of different lengths are being compared. "
-                + "Returning difference in lengths."
-            )
-            distance = float(abs(len_a - len_b))
-
-    # If both inputs are numbers, return their difference
-    elif isinstance(thing_a, (int, float)) and isinstance(thing_b, (int, float)):
-        distance = float(abs(thing_a - thing_b))
-    # If both inputs are array-like, return the maximum absolute difference b/w
-    # corresponding elements (if same shape); return largest difference in dimensions
-    # if shapes do not align.
-    elif hasattr(thing_a, "shape") and hasattr(thing_b, "shape"):
-        if thing_a.shape == thing_b.shape:
-            distance = np.max(abs(thing_a - thing_b))
-        else:
-            # Flatten arrays so they have the same dimensions
-            distance = np.max(
-                abs(thing_a.flatten().shape[0] - thing_b.flatten().shape[0])
-            )
-    # If none of the above cases, but the objects are of the same class, call
-    # the distance method of one on the other
-    elif thing_a.__class__.__name__ == thing_b.__class__.__name__:
-        if thing_a.__class__.__name__ == "function":
-            distance = 0.0
-        else:
-            distance = thing_a.distance(thing_b)
-    else:  # Failsafe: the inputs are very far apart
-        distance = 1000.0
-    return distance
-
-
-class MetricObject:
-    """
-    A superclass for object classes in HARK.  Comes with two useful methods:
-    a generic/universal distance method and an attribute assignment method.
+    _length : int
+        The terminal age of the agents in the model.
+    _invariant_params : list
+        A list of the names of the parameters that are invariant over time.
+    _varying_params : list
+        A list of the names of the parameters that vary over time.
     """
 
-    distance_criteria = []  # This should be overwritten by subclasses.
-
-    def distance(self, other):
+    def __init__(self, **parameters: Any):
         """
-        A generic distance method, which requires the existence of an attribute
-        called distance_criteria, giving a list of strings naming the attributes
-        to be considered by the distance metric.
+        Initializes a Parameters object and parses the age-varying
+        dynamics of the parameters.
 
         Parameters
         ----------
-        other : object
-            Another object to compare this instance to.
 
-        Returns
-        -------
-        (unnamed) : float
-            The distance between this object and another, using the "universal
-            distance" metric.
+        parameters : keyword arguments
+            Any number of keyword arguments of the form key=value.
+            To parse a dictionary of parameters, use the ** operator.
         """
-        distance_list = [0.0]
-        for attr_name in self.distance_criteria:
-            try:
-                obj_a = getattr(self, attr_name)
-                obj_b = getattr(other, attr_name)
-                distance_list.append(distance_metric(obj_a, obj_b))
-            except AttributeError:
-                distance_list.append(
-                    1000.0
-                )  # if either object lacks attribute, they are not the same
-        return max(distance_list)
+        params = parameters.copy()
+        self._length = params.pop("T_cycle", None)
+        self._invariant_params = set()
+        self._varying_params = set()
+        self._parameters: Dict[str, Union[int, float, np.ndarray, list, tuple]] = {}
+
+        for key, value in params.items():
+            self._parameters[key] = self.__infer_dims__(key, value)
+
+    def __infer_dims__(
+        self, key: str, value: Union[int, float, np.ndarray, list, tuple, None]
+    ) -> Union[int, float, np.ndarray, list, tuple]:
+        """
+        Infers the age-varying dimensions of a parameter.
+
+        If the parameter is a scalar, numpy array, or None, it is assumed to be
+        invariant over time. If the parameter is a list or tuple, it is assumed
+        to be varying over time. If the parameter is a list or tuple of length
+        greater than 1, the length of the list or tuple must match the
+        `_term_age` attribute of the Parameters object.
+
+        Parameters
+        ----------
+        key : str
+            name of parameter
+        value : Any
+            value of parameter
+
+        """
+        if isinstance(value, (int, float, np.ndarray, type(None))):
+            self.__add_to_invariant__(key)
+            return value
+        if isinstance(value, (list, tuple)):
+            if len(value) == 1:
+                self.__add_to_invariant__(key)
+                return value[0]
+            if self._length is None or self._length == 1:
+                self._length = len(value)
+            if len(value) == self._length:
+                self.__add_to_varying__(key)
+                return value
+            raise ValueError(
+                f"Parameter {key} must be of length 1 or {self._length}, not {len(value)}"
+            )
+        raise ValueError(f"Parameter {key} has unsupported type {type(value)}")
+
+    def __add_to_invariant__(self, key: str):
+        """
+        Adds parameter name to invariant set and removes from varying set.
+        """
+        self._varying_params.discard(key)
+        self._invariant_params.add(key)
+
+    def __add_to_varying__(self, key: str):
+        """
+        Adds parameter name to varying set and removes from invariant set.
+        """
+        self._invariant_params.discard(key)
+        self._varying_params.add(key)
+
+    def __getitem__(self, item_or_key: Union[int, str]):
+        """
+        If item_or_key is an integer, returns a Parameters object with the parameters
+        that apply to that age. This includes all invariant parameters and the
+        `item_or_key`th element of all age-varying parameters. If item_or_key is a string,
+        it returns the value of the parameter with that name.
+        """
+        if isinstance(item_or_key, int):
+            if item_or_key >= self._length:
+                raise ValueError(
+                    f"Age {item_or_key} is greater than or equal to terminal age {self._length}."
+                )
+
+            params = {key: self._parameters[key] for key in self._invariant_params}
+            params.update(
+                {
+                    key: self._parameters[key][item_or_key]
+                    for key in self._varying_params
+                }
+            )
+            return Parameters(**params)
+        elif isinstance(item_or_key, str):
+            return self._parameters[item_or_key]
+
+    def __setitem__(self, key: str, value: Any):
+        """
+        Sets the value of a parameter.
+
+        Parameters
+        ----------
+        key : str
+            name of parameter
+        value : Any
+            value of parameter
+
+        """
+        if not isinstance(key, str):
+            raise ValueError("Parameters must be set with a string key")
+        self._parameters[key] = self.__infer_dims__(key, value)
+
+    def keys(self):
+        """
+        Returns a list of the names of the parameters.
+        """
+        return self._invariant_params | self._varying_params
+
+    def values(self):
+        """
+        Returns a list of the values of the parameters.
+        """
+        return list(self._parameters.values())
+
+    def items(self):
+        """
+        Returns a list of tuples of the form (name, value) for each parameter.
+        """
+        return list(self._parameters.items())
+
+    def __iter__(self):
+        """
+        Allows for iterating over the parameter names.
+        """
+        return iter(self.keys())
+
+    def __deepcopy__(self, memo):
+        """
+        Returns a deep copy of the Parameters object.
+        """
+        return Parameters(**deepcopy(self.to_dict(), memo))
+
+    def to_dict(self):
+        """
+        Returns a dictionary of the parameters.
+        """
+        return {key: self._parameters[key] for key in self.keys()}
+
+    def to_namedtuple(self):
+        """
+        Returns a namedtuple of the parameters.
+        """
+        return namedtuple("Parameters", self.keys())(**self.to_dict())
+
+    def update(self, other_params):
+        """
+        Updates the parameters with the values from another
+        Parameters object or a dictionary.
+
+        Parameters
+        ----------
+        other_params : Parameters or dict
+            Parameters object or dictionary of parameters to update with.
+        """
+        if isinstance(other_params, Parameters):
+            self._parameters.update(other_params.to_dict())
+        elif isinstance(other_params, dict):
+            self._parameters.update(other_params)
+        else:
+            raise ValueError("Parameters must be a dict or a Parameters object")
+
+    def __str__(self):
+        """
+        Returns a simple string representation of the Parameters object.
+        """
+        return f"Parameters({str(self.to_dict())})"
+
+    def __repr__(self):
+        """
+        Returns a detailed string representation of the Parameters object.
+        """
+        return f"Parameters( _age_inv = {self._invariant_params}, _age_var = {self._varying_params}, | {self.to_dict()})"
 
 
 class Model:
     """
     A class with special handling of parameters assignment.
     """
+
+    def __init__(self):
+        if not hasattr(self, "parameters"):
+            self.parameters = {}
 
     def assign_parameters(self, **kwds):
         """
@@ -193,11 +306,7 @@ class Model:
         if isinstance(other, type(self)):
             return self.parameters == other.parameters
 
-        return notImplemented
-
-    def __init__(self):
-        if not hasattr(self, "parameters"):
-            self.parameters = {}
+        return NotImplemented
 
     def __str__(self):
         type_ = type(self)
@@ -1241,8 +1350,8 @@ class Market(Model):
         super().__init__()
         self.agents = agents if agents is not None else list()  # NOQA
 
-        reap_vars = reap_vars if reap_vars is not None else list()  # NOQA
-        self.reap_state = {var: [] for var in reap_vars}
+        self.reap_vars = reap_vars if reap_vars is not None else list()  # NOQA
+        self.reap_state = {var: [] for var in self.reap_vars}
 
         self.sow_vars = sow_vars if sow_vars is not None else list()  # NOQA
         # dictionaries for tracking initial and current values
@@ -1511,7 +1620,6 @@ class Market(Model):
             Should have attributes named in dyn_vars.
         """
         # Make a dictionary of inputs for the dynamics calculator
-        history_vars_string = ""
         arg_names = list(get_arg_names(self.calc_dynamics))
         if "self" in arg_names:
             arg_names.remove("self")
@@ -1560,3 +1668,259 @@ def distribute_params(agent, param_name, param_count, distribution):
         agent_set[j].assign_parameters(**{param_name: param_dist.atoms[0, j]})
 
     return agent_set
+
+
+@dataclass
+class AgentPopulation:
+    """
+    A class for representing a population of ex-ante heterogeneous agents.
+    """
+
+    agent_type: AgentType  # type of agent in the population
+    parameters: dict  # dictionary of parameters
+    seed: int = 0  # random seed
+    time_var: List[str] = field(init=False)
+    time_inv: List[str] = field(init=False)
+    distributed_params: List[str] = field(init=False)
+    agent_type_count: Optional[int] = field(init=False)
+    term_age: Optional[int] = field(init=False)
+    continuous_distributions: Dict[str, Distribution] = field(init=False)
+    discrete_distributions: Dict[str, Distribution] = field(init=False)
+    population_parameters: List[Dict[str, Union[List[float], float]]] = field(
+        init=False
+    )
+    agents: List[AgentType] = field(init=False)
+    agent_database: pd.DataFrame = field(init=False)
+    solution: List[Any] = field(init=False)
+
+    def __post_init__(self):
+        """
+        Initialize the population of agents, determine distributed parameters,
+        and infer `agent_type_count` and `term_age`.
+        """
+        # create a dummy agent and obtain its time-varying
+        # and time-invariant attributes
+        dummy_agent = self.agent_type()
+        self.time_var = dummy_agent.time_vary
+        self.time_inv = dummy_agent.time_inv
+
+        # create list of distributed parameters
+        # these are parameters that differ across agents
+        self.distributed_params = [
+            key
+            for key, param in self.parameters.items()
+            if (isinstance(param, list) and isinstance(param[0], list))
+            or isinstance(param, Distribution)
+            or (isinstance(param, DataArray) and param.dims[0] == "agent")
+        ]
+
+        self.__infer_counts__()
+
+    def __infer_counts__(self):
+        """
+        Infer `agent_type_count` and `term_age` from the parameters.
+        If parameters include a `Distribution` type, a list of lists,
+        or a `DataArray` with `agent` as the first dimension, then
+        the AgentPopulation contains ex-ante heterogenous agents.
+        """
+
+        # infer agent_type_count from distributed parameters
+        agent_type_count = 1
+        for key in self.distributed_params:
+            param = self.parameters[key]
+            if isinstance(param, Distribution):
+                agent_type_count = None
+                warn(
+                    "Cannot infer agent_type_count from a Distribution. "
+                    "Please provide approximation parameters."
+                )
+                break
+            elif isinstance(param, list):
+                agent_type_count = max(agent_type_count, len(param))
+            elif isinstance(param, DataArray) and param.dims[0] == "agent":
+                agent_type_count = max(agent_type_count, param.shape[0])
+
+        self.agent_type_count = agent_type_count
+
+        # infer term_age from all parameters
+        term_age = 1
+        for param in self.parameters.values():
+            if isinstance(param, Distribution):
+                term_age = None
+                warn(
+                    "Cannot infer term_age from a Distribution. "
+                    "Please provide approximation parameters."
+                )
+                break
+            elif isinstance(param, list) and isinstance(param[0], list):
+                term_age = max(term_age, len(param[0]))
+            elif isinstance(param, DataArray) and param.dims[-1] == "age":
+                term_age = max(term_age, param.shape[-1])
+
+        self.term_age = term_age
+
+    def approx_distributions(self, approx_params: dict):
+        """
+        Approximate continuous distributions with discrete ones. If the initial
+        parameters include a `Distribution` type, then the AgentPopulation is
+        not ready to solve, and stands for an abstract population. To solve the
+        AgentPopulation, we need discretization parameters for each continuous
+        distribution. This method approximates the continuous distributions with
+        discrete ones, and updates the parameters dictionary.
+        """
+        self.continuous_distributions = {}
+        self.discrete_distributions = {}
+
+        for key, points in approx_params.items():
+            param = self.parameters[key]
+            if key in self.distributed_params and isinstance(param, Distribution):
+                self.continuous_distributions[key] = param
+                self.discrete_distributions[key] = param.discretize(points)
+            else:
+                raise ValueError(
+                    f"Warning: parameter {key} is not a Distribution found "
+                    f"in agent type {self.agent_type}"
+                )
+
+        if len(self.discrete_distributions) > 1:
+            joint_dist = combine_indep_dstns(*self.discrete_distributions.values())
+        else:
+            joint_dist = list(self.discrete_distributions.values())[0]
+
+        for i, key in enumerate(self.discrete_distributions):
+            self.parameters[key] = DataArray(joint_dist.atoms[i], dims=("agent"))
+
+        self.__infer_counts__()
+
+    def __parse_parameters__(self) -> None:
+        """
+        Creates distributed dictionaries of parameters for each ex-ante
+        heterogeneous agent in the parameterized population. The parameters
+        are stored in a list of dictionaries, where each dictionary contains
+        the parameters for one agent. Expands parameters that vary over time
+        to a list of length `term_age`.
+        """
+
+        population_parameters = []  # container for dictionaries of each agent subgroup
+        for agent in range(self.agent_type_count):
+            agent_parameters = {}
+            for key, param in self.parameters.items():
+                if key in self.time_var:
+                    # parameters that vary over time have to be repeated
+                    if isinstance(param, (int, float)):
+                        parameter_per_t = [param] * self.term_age
+                    elif isinstance(param, list):
+                        if isinstance(param[0], list):
+                            parameter_per_t = param[agent]
+                        else:
+                            parameter_per_t = param
+                    elif isinstance(param, DataArray):
+                        if param.dims[0] == "agent":
+                            if param.dims[-1] == "age":
+                                parameter_per_t = param[agent].item()
+                            else:
+                                parameter_per_t = param.item()
+                        elif param.dims[0] == "age":
+                            parameter_per_t = param.item()
+
+                    agent_parameters[key] = parameter_per_t
+
+                elif key in self.time_inv:
+                    if isinstance(param, (int, float)):
+                        agent_parameters[key] = param
+                    elif isinstance(param, list):
+                        if isinstance(param[0], list):
+                            agent_parameters[key] = param[agent]
+                        else:
+                            agent_parameters[key] = param
+                    elif isinstance(param, DataArray) and param.dims[0] == "agent":
+                        agent_parameters[key] = param[agent].item()
+
+                else:
+                    if isinstance(param, (int, float)):
+                        agent_parameters[key] = param  # assume time inv
+                    elif isinstance(param, list):
+                        if isinstance(param[0], list):
+                            agent_parameters[key] = param[agent]  # assume agent vary
+                        else:
+                            agent_parameters[key] = param  # assume time vary
+                    elif isinstance(param, DataArray):
+                        if param.dims[0] == "agent":
+                            if param.dims[-1] == "age":
+                                agent_parameters[key] = param[
+                                    agent
+                                ].item()  # assume agent vary
+                            else:
+                                agent_parameters[key] = param.item()  # assume time vary
+                        elif param.dims[0] == "age":
+                            agent_parameters[key] = param.item()  # assume time vary
+
+            population_parameters.append(agent_parameters)
+
+        self.population_parameters = population_parameters
+
+    def create_distributed_agents(self):
+        """
+        Parses the parameters dictionary and creates a list of agents with the
+        appropriate parameters. Also sets the seed for each agent.
+        """
+
+        self.__parse_parameters__()
+
+        rng = np.random.default_rng(self.seed)
+
+        self.agents = [
+            self.agent_type(seed=rng.integers(0, 2**31 - 1), **agent_dict)
+            for agent_dict in self.population_parameters
+        ]
+
+    def create_database(self):
+        """
+        Optionally creates a pandas DataFrame with the parameters for each agent.
+        """
+        database = pd.DataFrame(self.population_parameters)
+        database["agents"] = self.agents
+
+        self.agent_database = database
+
+    def solve(self):
+        """
+        Solves each agent of the population serially.
+        """
+
+        # see Market class for an example of how to solve distributed agents in parallel
+
+        for agent in self.agents:
+            agent.solve()
+
+    def unpack_solutions(self):
+        """
+        Unpacks the solutions of each agent into an attribute of the population.
+        """
+        self.solution = [agent.solution for agent in self.agents]
+
+    def initialize_sim(self):
+        """
+        Initializes the simulation for each agent.
+        """
+        for agent in self.agents:
+            agent.initialize_sim()
+
+    def simulate(self):
+        """
+        Simulates each agent of the population serially.
+        """
+        for agent in self.agents:
+            agent.simulate()
+
+    def __iter__(self):
+        """
+        Allows for iteration over the agents in the population.
+        """
+        return iter(self.agents)
+
+    def __getitem__(self, idx):
+        """
+        Allows for indexing into the population.
+        """
+        return self.agents[idx]
